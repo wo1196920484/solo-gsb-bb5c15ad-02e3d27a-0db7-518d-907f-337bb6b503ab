@@ -14,10 +14,20 @@
 - 分帖边界依次最小化：各帖补至 4 的倍数所需空白总数 → 帖数；
   仍相同则优先最早的分帖边界；
 - 每帖各自在尾部补空白至 4 的倍数，再按规则 3/4 拼版。
+
+印张抽检（``inspect_imposition``）
+----
+- 先按相同规则生成预期印张；每张观测印张可按 原样 / 左右镜像 /
+  正反互换 / 两者组合 四种变换解释；
+- 仅当观测至少一个非空已读 ID 出现在某张预期印张上时允许两者配对；
+- 每张预期印张与每张观测至多使用一次：先最大化配对数，再最大化
+  已读页位吻合总数，同分按观测序号、预期帖号/张号、变换顺序裁决；
+- ``"?"``（未读出）页位不计入吻合数，也不计错。
 """
 from __future__ import annotations
 
-from typing import Collection, List, Literal, Optional, Tuple, TypeVar
+import heapq
+from typing import Collection, Dict, List, Literal, Optional, Tuple, TypeVar
 
 Binding = Literal["left", "right"]
 
@@ -348,4 +358,293 @@ def plan_reprint(
         "signature_count": len(result_signatures),
         "reprint_sheet_count": reprint_count,
         "signatures": result_signatures,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 印张抽检（inspect）：乱序实物印张与预期拼版的配对
+# ---------------------------------------------------------------------------
+
+#: 页位“未读出”标记（页面 ID 不得使用该字符串）
+UNREAD = "?"
+
+#: 观测印张可采用的解释变换，按裁决优先级排列：
+#: identity=原样，mirror=左右镜像，flip=正反互换，mirror_flip=两者组合
+INSPECT_TRANSFORMS = ("identity", "mirror", "flip", "mirror_flip")
+
+# 四页位名称，顺序与 SheetKey 一致：正左、正右、背左、背右
+_POSITION_NAMES = ("front.left", "front.right", "back.left", "back.right")
+
+
+def _transform_perm(transform: str) -> Tuple[int, int, int, int]:
+    """对齐排列：预期第 k 个页位对应观测四元组的第 perm[k] 个页位。"""
+    if transform == "identity":
+        return (0, 1, 2, 3)
+    if transform == "mirror":
+        # 左右镜像：观测的左页位实为预期的右页位
+        return (1, 0, 3, 2)
+    if transform == "flip":
+        # 正反互换：观测的正面实为预期的背面
+        return (2, 3, 0, 1)
+    # mirror_flip：左右镜像与正反互换的组合
+    return (3, 2, 1, 0)
+
+
+def _best_transform(
+    obs: SheetKey,
+    exp: SheetKey,
+) -> Tuple[int, str, Tuple[int, int, int, int]]:
+    """观测 ``obs`` 对预期 ``exp`` 的最佳解释：(已读页位吻合数, 变换, 对齐排列)。
+
+    已读出（非 ``"?"``）且与预期一致的页位计入吻合数；吻合数相同按
+    :data:`INSPECT_TRANSFORMS` 顺序取先者。
+    """
+    best_matches = -1
+    best_transform = INSPECT_TRANSFORMS[0]
+    best_perm = _transform_perm(best_transform)
+    for transform in INSPECT_TRANSFORMS:
+        perm = _transform_perm(transform)
+        matches = sum(
+            1 for k in range(4)
+            if obs[perm[k]] != UNREAD and obs[perm[k]] == exp[k]
+        )
+        if matches > best_matches:
+            best_matches = matches
+            best_transform = transform
+            best_perm = perm
+    return best_matches, best_transform, best_perm
+
+
+def _max_weight_matching(
+    n_left: int,
+    n_right: int,
+    edge_costs: Dict[Tuple[int, int], int],
+) -> List[Tuple[int, int]]:
+    """非负费用二分图的最小费用最大流，返回配对的 (左下标, 右下标) 列表。
+
+    所有边费用非负，连续最短增广路（Dijkstra + 势函数）增广至无可增广路
+    为止，得到最小费用最大流：先最大化配对数，再最小化总费用
+    （即最大化总权重，权重 = 常数 - 费用）。
+    """
+    size = n_left + n_right + 2
+    source, sink = 0, size - 1
+    # 邻接表，边为 [终点, 剩余容量, 单位费用, 反向边下标]
+    graph: List[List[list]] = [[] for _ in range(size)]
+
+    def add_edge(u: int, v: int, cap: int, cost: int) -> None:
+        graph[u].append([v, cap, cost, len(graph[v])])
+        graph[v].append([u, 0, -cost, len(graph[u]) - 1])
+
+    for i in range(n_left):
+        add_edge(source, 1 + i, 1, 0)
+    for (i, j), cost in edge_costs.items():
+        add_edge(1 + i, 1 + n_left + j, 1, cost)
+    for j in range(n_right):
+        add_edge(1 + n_left + j, sink, 1, 0)
+
+    inf = float("inf")
+    potential = [0] * size  # 初始费用非负，零势函数即满足既约费用非负
+    while True:
+        dist = [inf] * size
+        prev_node = [-1] * size
+        prev_edge = [-1] * size
+        dist[source] = 0
+        heap: List[Tuple[int, int]] = [(0, source)]
+        while heap:
+            d, u = heapq.heappop(heap)
+            if d > dist[u]:
+                continue
+            for k, edge in enumerate(graph[u]):
+                v, cap, cost, _ = edge
+                if cap <= 0:
+                    continue
+                nd = d + cost + potential[u] - potential[v]
+                if nd < dist[v]:
+                    dist[v] = nd
+                    prev_node[v] = u
+                    prev_edge[v] = k
+                    heapq.heappush(heap, (nd, v))
+        if dist[sink] == inf:
+            break
+        for v in range(size):
+            if dist[v] < inf:
+                potential[v] += dist[v]
+        # 沿最短增广路增广 1 单位流量
+        v = sink
+        while v != source:
+            edge = graph[prev_node[v]][prev_edge[v]]
+            edge[1] -= 1
+            graph[v][edge[3]][1] += 1
+            v = prev_node[v]
+
+    pairs: List[Tuple[int, int]] = []
+    for i in range(n_left):
+        for edge in graph[1 + i]:
+            # 左->右正向边容量被用光（剩余 0）即表示该边被选中
+            if 1 + n_left <= edge[0] < 1 + n_left + n_right and edge[1] == 0:
+                pairs.append((i, edge[0] - 1 - n_left))
+    return pairs
+
+
+def inspect_imposition(
+    page_ids: List[str],
+    max_sheets: int,
+    binding: Binding,
+    observed_sheets: List[dict],
+) -> dict:
+    """把乱序观测的实物印张与预期拼版印张一一配对，并给出已知页位错误明细。
+
+    配对规则：
+
+    1. 先用与 :func:`impose_from_pages` 相同的规则生成预期印张；
+    2. 每张观测可按四种变换解释：identity（原样）、mirror（左右镜像）、
+       flip（正反互换）、mirror_flip（两者组合）；
+    3. 仅当观测至少一个非空且已读出的页面 ID 出现在某张预期印张上时，
+       该观测才允许与该预期印张配对；
+    4. 每张预期印张与每张观测至多使用一次，依次优化：配对数最大 →
+       已读页位吻合总数最大 → 按观测序号、预期帖号/张号、变换顺序
+       取字典序最小者（配对优于不配对）；
+    5. ``"?"`` 页位不参与吻合计数，也不计入错误；空白（``None``）页位
+       视为已读，与预期一致计吻合、不一致计错误。
+
+    ``observed_sheets`` 每项为 ``{"front": {"left", "right"}, "back": {...}}``，
+    页位取值为页面 ID、``None``（空白）或 ``"?"``（未读出）。
+
+    返回每张观测的配对结果与错误明细、未被观测到的预期印张
+    （``missing_sheets``）与无法配对的观测（``unmatched_observations``）。
+    """
+    expected = impose_from_pages(page_ids, max_sheets, binding)
+    exp_sheets: List[dict] = []
+    for signature in expected:
+        for sheet in signature["sheets"]:
+            exp_sheets.append(
+                {
+                    "signature_index": signature["signature_index"],
+                    "sheet_index": sheet["sheet_index"],
+                    "key": _sheet_key(sheet),
+                    "front": sheet["front"],
+                    "back": sheet["back"],
+                }
+            )
+
+    obs_keys: List[SheetKey] = [
+        (
+            observed["front"]["left"],
+            observed["front"]["right"],
+            observed["back"]["left"],
+            observed["back"]["right"],
+        )
+        for observed in observed_sheets
+    ]
+
+    n = len(obs_keys)
+    m = len(exp_sheets)
+
+    # 候选边：观测至少一个非空已读 ID 出现在该预期印张上才允许配对。
+    # 边权 = 吻合数 * MATCH_MULT + 字典序项：字典序项按观测序号指数递减、
+    # 同一观测内随预期（帖号, 张号）升序递减，保证“先吻合总数，再按
+    # 观测序号、预期帖号/张号裁决”；配对本身权重恒正，故最大流即最大配对数。
+    edge_costs: Dict[Tuple[int, int], int] = {}
+    edge_info: Dict[Tuple[int, int], Tuple[int, str, Tuple[int, int, int, int]]] = {}
+    if n and m:
+        base = m + 1
+        match_mult = base ** n  # 大于任何可能的字典序项总和
+        max_weight = match_mult * 4 + base ** n  # 大于任何单边权重
+        exp_id_sets = [
+            {page_id for page_id in exp["key"] if page_id is not None}
+            for exp in exp_sheets
+        ]
+        for i, obs in enumerate(obs_keys):
+            read_ids = {v for v in obs if v is not None and v != UNREAD}
+            if not read_ids:
+                continue
+            lex_unit = base ** (n - 1 - i)
+            for j, exp in enumerate(exp_sheets):
+                if read_ids.isdisjoint(exp_id_sets[j]):
+                    continue
+                matches, transform, perm = _best_transform(obs, exp["key"])
+                weight = match_mult * matches + lex_unit * (m - j)
+                edge_costs[(i, j)] = max_weight - weight
+                edge_info[(i, j)] = (matches, transform, perm)
+
+    pairs = _max_weight_matching(n, m, edge_costs)
+
+    matched_obs: Dict[int, Tuple[int, int, str, Tuple[int, int, int, int]]] = {}
+    used_exp = set()
+    for i, j in pairs:
+        matches, transform, perm = edge_info[(i, j)]
+        matched_obs[i] = (j, matches, transform, perm)
+        used_exp.add(j)
+
+    observations: List[dict] = []
+    for i, observed in enumerate(observed_sheets):
+        entry = {
+            "observation_index": i + 1,
+            "front": observed["front"],
+            "back": observed["back"],
+        }
+        if i in matched_obs:
+            j, matches, transform, perm = matched_obs[i]
+            exp = exp_sheets[j]
+            errors: List[dict] = []
+            for k in range(4):
+                read = obs_keys[i][perm[k]]
+                if read != UNREAD and read != exp["key"][k]:
+                    errors.append(
+                        {
+                            "position": _POSITION_NAMES[perm[k]],
+                            "observed": read,
+                            "expected": exp["key"][k],
+                        }
+                    )
+            entry.update(
+                {
+                    "matched": True,
+                    "signature_index": exp["signature_index"],
+                    "sheet_index": exp["sheet_index"],
+                    "transform": transform,
+                    "matched_positions": matches,
+                    "errors": errors,
+                }
+            )
+        else:
+            entry.update(
+                {
+                    "matched": False,
+                    "signature_index": None,
+                    "sheet_index": None,
+                    "transform": None,
+                    "matched_positions": None,
+                    "errors": [],
+                }
+            )
+        observations.append(entry)
+
+    missing_sheets = [
+        {
+            "signature_index": exp["signature_index"],
+            "sheet_index": exp["sheet_index"],
+            "front": exp["front"],
+            "back": exp["back"],
+        }
+        for j, exp in enumerate(exp_sheets)
+        if j not in used_exp
+    ]
+    unmatched_observations = [
+        {
+            "observation_index": i + 1,
+            "front": observed["front"],
+            "back": observed["back"],
+        }
+        for i, observed in enumerate(observed_sheets)
+        if i not in matched_obs
+    ]
+
+    return {
+        "signature_count": len(expected),
+        "sheet_count": m,
+        "matched_count": len(pairs),
+        "observations": observations,
+        "missing_sheets": missing_sheets,
+        "unmatched_observations": unmatched_observations,
     }

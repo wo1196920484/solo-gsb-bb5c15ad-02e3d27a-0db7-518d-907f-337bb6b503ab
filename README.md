@@ -10,6 +10,11 @@
 在新版四页位与旧版某印张完全相同且均未改动时整张复用（允许跨帖、每张旧印张最多复用一次），
 否则标记整张重印。
 
+另有**印张抽检**接口 `/api/v1/impose/inspect`：输入按阅读顺序的页面 ID 与乱序观测的实物印张
+四页位（页位可为页面 ID、`null` 空白或 `"?"` 未读出），把观测与预期拼版一一配对
+（允许左右镜像、正反互换等解释），返回每张观测对应的帖/张、解释变换与已知页位错误明细，
+并列出未见的预期印张与无法配对的观测。
+
 ## 一条命令启动
 
 需要安装 Docker（含 Compose 插件），在项目根目录执行：
@@ -49,6 +54,7 @@ HOST_PORT=9000 docker compose up -d --build
 - 拼版接口：`POST http://localhost:8000/api/v1/impose`
 - 章节分帖拼版接口：`POST http://localhost:8000/api/v1/impose/chapters`
 - 重印复用接口：`POST http://localhost:8000/api/v1/impose/reprint`
+- 印张抽检接口：`POST http://localhost:8000/api/v1/impose/inspect`
 
 ## 接口说明
 
@@ -295,6 +301,143 @@ curl -X POST http://localhost:8000/api/v1/impose/reprint \
 除与 `/api/v1/impose` 相同的校验（`max_sheets_per_signature`、`binding`、未定义字段等）外，
 任一版页面 ID 列表为空、包含空字符串、版内 ID 重复，或 `changed_page_ids` 包含空字符串、
 含有不属于新版的页面 ID 时，均返回 `422 Unprocessable Entity`。
+
+## 印张抽检（POST /api/v1/impose/inspect）
+
+印刷抽检场景：先按页面 ID 生成**预期拼版**，再把**乱序**读到的实物印张与预期印张一一配对，
+找出每张实物印张对应的帖/张与摆放方式，并报告已知页位错误。本地访问地址
+`http://localhost:8000/api/v1/impose/inspect`（改了 `HOST_PORT` 则对应替换端口）。
+
+预期拼版沿用 `/api/v1/impose` 的分帖、末帖尾部补空白与左右页位规则（以页面 ID 代替页码）。
+
+### 请求
+
+`POST /api/v1/impose/inspect`，`Content-Type: application/json`
+
+| 字段 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `page_ids` | 字符串数组 | 非空数组；元素为非空字符串、互异、**不得为 `"?"`** | 全书页面 ID，按阅读顺序排列 |
+| `max_sheets_per_signature` | 整数 | ≥ 1 | 每帖最多纸张数；每帖最多容纳其 **4 倍**页数 |
+| `binding` | 字符串 | `left` / `right` | 装订方向：左装订 / 右装订 |
+| `observed_sheets` | 对象数组 | 可为空数组；每项含 `front` / `back`，各含 `left` / `right` | 乱序的实物印张四页位观测 |
+
+观测页位取值有三种：**页面 ID**（字符串）、`null`（空白页位）、`"?"`（未读出）。
+`"?"` 保留为未读出标记，因此页面 ID 不得为 `"?"`；观测中读到但不在 `page_ids`
+内的 ID 是允许的（按错页处理）。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/impose/inspect \
+  -H "Content-Type: application/json" \
+  -d '{
+    "page_ids": ["p1","p2","p3","p4","p5","p6","p7","p8","p9","p10","p11","p12"],
+    "max_sheets_per_signature": 3,
+    "binding": "left",
+    "observed_sheets": [
+      {"front": {"left": "p3", "right": "p10"}, "back": {"left": "p9", "right": "p4"}},
+      {"front": {"left": "p12", "right": "?"},  "back": {"left": "p99", "right": "p11"}},
+      {"front": {"left": "x1", "right": "x2"},  "back": {"left": null, "right": null}}
+    ]
+  }'
+```
+
+### 配对规则
+
+1. 每张观测可按四种**解释变换**与预期印张比对：
+   `identity`（原样）、`mirror`（左右镜像）、`flip`（正反互换）、
+   `mirror_flip`（左右镜像 + 正反互换）。
+2. **允许配对的前提**：观测中至少一个非空且已读出的页面 ID 出现在该预期印张的
+   四个页位上（全为 `null` / `"?"` 的观测无法与任何预期印张配对）。
+3. 每张预期印张与每张观测**至多使用一次**。在此约束下依次优化：
+   - **配对数最大**；
+   - **已读页位吻合总数最大**（已读出且与预期一致的页位个数；`null` 与 `null`
+     一致也算吻合）；
+   - 仍相同则按**观测序号 → 预期帖号/张号 → 变换顺序**（上列变换的给出顺序）
+     依次取字典序最小者裁决（观测能配对优于不配对）。
+4. `"?"` 页位既不计入吻合数，也**不计错**；其余不一致的已读页位计入错误明细。
+
+### 响应
+
+按**观测序号**（从 1 开始，即请求顺序）逐张返回：
+
+- `matched` / `signature_index` / `sheet_index`：是否配对及对应的预期帖号、张号
+  （未配对时后三者均为 `null`）；
+- `transform`：配对的解释变换（未配对为 `null`）；
+- `matched_positions`：该配对中已读页位与预期吻合的个数 0–4（未配对为 `null`）；
+- `errors`：已知页位错误明细，`position` 为观测印张上的页位
+  （`front.left` / `front.right` / `back.left` / `back.right`），
+  `observed` 为实际读到的值，`expected` 为按配对变换该页位应有的值；
+- 顶层 `missing_sheets`：未见的预期印张（未被任何观测配对，含预期四页位）；
+- 顶层 `unmatched_observations`：无法配对的观测。
+
+```json
+{
+  "page_ids": ["p1","p2","p3","p4","p5","p6","p7","p8","p9","p10","p11","p12"],
+  "max_sheets_per_signature": 3,
+  "binding": "left",
+  "signature_count": 1,
+  "sheet_count": 3,
+  "observation_count": 3,
+  "matched_count": 2,
+  "observations": [
+    {
+      "observation_index": 1,
+      "front": { "left": "p3", "right": "p10" },
+      "back":  { "left": "p9", "right": "p4" },
+      "matched": true,
+      "signature_index": 1,
+      "sheet_index": 2,
+      "transform": "mirror",
+      "matched_positions": 4,
+      "errors": []
+    },
+    {
+      "observation_index": 2,
+      "front": { "left": "p12", "right": "?" },
+      "back":  { "left": "p99", "right": "p11" },
+      "matched": true,
+      "signature_index": 1,
+      "sheet_index": 1,
+      "transform": "identity",
+      "matched_positions": 2,
+      "errors": [
+        { "position": "back.left", "observed": "p99", "expected": "p2" }
+      ]
+    },
+    {
+      "observation_index": 3,
+      "front": { "left": "x1", "right": "x2" },
+      "back":  { "left": null, "right": null },
+      "matched": false,
+      "signature_index": null,
+      "sheet_index": null,
+      "transform": null,
+      "matched_positions": null,
+      "errors": []
+    }
+  ],
+  "missing_sheets": [
+    {
+      "signature_index": 1,
+      "sheet_index": 3,
+      "front": { "left": "p8", "right": "p5" },
+      "back":  { "left": "p6", "right": "p7" }
+    }
+  ],
+  "unmatched_observations": [
+    {
+      "observation_index": 3,
+      "front": { "left": "x1", "right": "x2" },
+      "back":  { "left": null, "right": null }
+    }
+  ]
+}
+```
+
+### 非法参数（4xx）
+
+除与 `/api/v1/impose` 相同的校验（`max_sheets_per_signature`、`binding`、未定义字段等）外，
+`page_ids` 为空、包含空字符串、包含 `"?"`、存在重复，或观测页位为空白字符串时，
+均返回 `422 Unprocessable Entity`。
 
 ## 本地开发（不使用 Docker）
 

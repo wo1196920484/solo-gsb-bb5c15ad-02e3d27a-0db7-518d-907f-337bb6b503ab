@@ -5,9 +5,9 @@ from typing import Literal, Optional
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, ConfigDict, model_validator
+from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 
-from .imposition import impose, impose_chapters, plan_reprint
+from .imposition import impose, impose_chapters, inspect_imposition, plan_reprint
 
 app = FastAPI(
     title="离线小册子拼版 API",
@@ -17,8 +17,10 @@ app = FastAPI(
         "右装订左右页位镜像交换。"
         "支持按章节首页分帖：章节不可跨帖，相邻章节可合帖。"
         "支持旧版/新版重印复用：四页位完全相同且均未改动的旧印张可整张复用。"
+        "支持印张抽检：将乱序观测的实物印张与预期拼版一一配对，"
+        "输出解释变换与已知页位错误明细。"
     ),
-    version="1.2.0",
+    version="1.3.0",
 )
 
 
@@ -193,6 +195,130 @@ class ReprintResponse(BaseModel):
     signatures: list[ReprintSignature] = Field(..., description="新版逐帖的复用/重印计划")
 
 
+class InspectPagePair(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    left: Optional[str] = Field(
+        ..., description='左页位：页面 ID、null（空白）或 "?"（未读出）'
+    )
+    right: Optional[str] = Field(
+        ..., description='右页位：页面 ID、null（空白）或 "?"（未读出）'
+    )
+
+    @field_validator("left", "right")
+    @classmethod
+    def validate_position(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and not value.strip():
+            raise ValueError('页位必须为页面 ID、null（空白）或 "?"（未读出），不能为空白字符串')
+        return value
+
+
+class ObservedSheet(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    front: InspectPagePair = Field(..., description="实物印张正面左右页位观测")
+    back: InspectPagePair = Field(..., description="实物印张背面左右页位观测")
+
+
+class InspectRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    page_ids: list[str] = Field(
+        ...,
+        min_length=1,
+        description='全书页面 ID，按阅读顺序排列；非空字符串、互异且不得为 "?"',
+    )
+    max_sheets_per_signature: int = Field(
+        ..., ge=1, description="每帖最多纸张数，正整数；每帖最多容纳其 4 倍页数"
+    )
+    binding: Literal["left", "right"] = Field(
+        ..., description="装订方向：left=左装订，right=右装订"
+    )
+    observed_sheets: list[ObservedSheet] = Field(
+        ..., description="乱序的实物印张四页位观测，可为空数组"
+    )
+
+    @model_validator(mode="after")
+    def validate_page_ids(self) -> "InspectRequest":
+        if any(not page_id or not page_id.strip() for page_id in self.page_ids):
+            raise ValueError("page_ids 中不能包含空字符串页面 ID")
+        if any(page_id == "?" for page_id in self.page_ids):
+            raise ValueError('页面 ID 不得为 "?"（"?" 保留为未读出标记）')
+        if len(self.page_ids) != len(set(self.page_ids)):
+            raise ValueError("page_ids 中的页面 ID 不能重复")
+        return self
+
+
+class InspectError(BaseModel):
+    position: str = Field(
+        ..., description="观测印张上的页位：front.left / front.right / back.left / back.right"
+    )
+    observed: Optional[str] = Field(
+        ..., description="该页位实际读到的页面 ID 或 null（空白）"
+    )
+    expected: Optional[str] = Field(
+        ..., description="按配对变换该页位应有的页面 ID 或 null（空白）"
+    )
+
+
+class InspectObservation(BaseModel):
+    observation_index: int = Field(..., description="观测序号，从 1 开始，按请求顺序")
+    front: InspectPagePair = Field(..., description="观测正面左右页位（原样回显）")
+    back: InspectPagePair = Field(..., description="观测背面左右页位（原样回显）")
+    matched: bool = Field(..., description="是否与某张预期印张配对")
+    signature_index: Optional[int] = Field(
+        ..., description="配对的预期帖号（从 1 开始）；未配对为 null"
+    )
+    sheet_index: Optional[int] = Field(
+        ..., description="配对的预期帖内张号（从 1 开始，1 为最外张）；未配对为 null"
+    )
+    transform: Optional[Literal["identity", "mirror", "flip", "mirror_flip"]] = Field(
+        ...,
+        description=(
+            "解释变换：identity=原样，mirror=左右镜像，flip=正反互换，"
+            "mirror_flip=两者组合；未配对为 null"
+        ),
+    )
+    matched_positions: Optional[int] = Field(
+        ..., description="该配对中已读页位与预期吻合的个数（0-4）；未配对为 null"
+    )
+    errors: list[InspectError] = Field(
+        ..., description='已知页位错误明细（"?" 不计错）；未配对时为空数组'
+    )
+
+
+class MissingSheet(BaseModel):
+    signature_index: int = Field(..., description="预期帖号，从 1 开始")
+    sheet_index: int = Field(..., description="预期帖内张号，从 1 开始（1 为最外张）")
+    front: IdPagePair = Field(..., description="预期正面左右页面 ID")
+    back: IdPagePair = Field(..., description="预期背面左右页面 ID")
+
+
+class UnmatchedObservation(BaseModel):
+    observation_index: int = Field(..., description="观测序号，从 1 开始，按请求顺序")
+    front: InspectPagePair = Field(..., description="观测正面左右页位（原样回显）")
+    back: InspectPagePair = Field(..., description="观测背面左右页位（原样回显）")
+
+
+class InspectResponse(BaseModel):
+    page_ids: list[str]
+    max_sheets_per_signature: int
+    binding: Literal["left", "right"]
+    signature_count: int = Field(..., description="预期帖数")
+    sheet_count: int = Field(..., description="预期印张总数")
+    observation_count: int = Field(..., description="观测印张总数")
+    matched_count: int = Field(..., description="成功配对的观测数（= 被配对的预期印张数）")
+    observations: list[InspectObservation] = Field(
+        ..., description="每张观测的配对结果，按请求顺序"
+    )
+    missing_sheets: list[MissingSheet] = Field(
+        ..., description="未见的预期印张（未被任何观测配对），按帖号、张号排列"
+    )
+    unmatched_observations: list[UnmatchedObservation] = Field(
+        ..., description="无法配对的观测，按观测序号排列"
+    )
+
+
 @app.get("/health", tags=["健康检查"])
 def health() -> dict:
     return {"status": "ok"}
@@ -267,6 +393,28 @@ def create_reprint_plan(request: ReprintRequest) -> ReprintResponse:
         signature_count=plan["signature_count"],
         reprint_sheet_count=plan["reprint_sheet_count"],
         signatures=plan["signatures"],
+    )
+
+
+@app.post(
+    "/api/v1/impose/inspect",
+    response_model=InspectResponse,
+    tags=["抽检"],
+    summary="印张抽检配对",
+)
+def create_inspection(request: InspectRequest) -> InspectResponse:
+    result = inspect_imposition(
+        page_ids=request.page_ids,
+        max_sheets=request.max_sheets_per_signature,
+        binding=request.binding,
+        observed_sheets=[sheet.model_dump() for sheet in request.observed_sheets],
+    )
+    return InspectResponse(
+        page_ids=request.page_ids,
+        max_sheets_per_signature=request.max_sheets_per_signature,
+        binding=request.binding,
+        observation_count=len(request.observed_sheets),
+        **result,
     )
 
 
