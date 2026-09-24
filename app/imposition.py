@@ -349,3 +349,301 @@ def plan_reprint(
         "reprint_sheet_count": reprint_count,
         "signatures": result_signatures,
     }
+
+
+# ---------------------------------------------------------------------------
+# 印张抽检（inspect）：乱序实物印张与预期拼版的配对核对
+# ---------------------------------------------------------------------------
+
+# 四页位固定顺序：(正面左, 正面右, 背面左, 背面右)，索引 0..3
+SLOT_ORDER: Tuple[str, str, str, str] = (
+    "front_left",
+    "front_right",
+    "back_left",
+    "back_right",
+)
+
+# 实物印张可被解释的四种变换（顺序即同分裁决时的变换顺序）：
+# 原样、左右镜像、正反互换、两者组合。
+# 每项给出“观测页位 i 应与预期页位 PERM[i] 比较”的位置置换。
+TRANSFORMS: Tuple[Tuple[str, Tuple[int, int, int, int]], ...] = (
+    ("none", (0, 1, 2, 3)),
+    ("mirror_lr", (1, 0, 3, 2)),
+    ("flip_fb", (2, 3, 0, 1)),
+    ("mirror_lr_flip_fb", (3, 2, 1, 0)),
+)
+
+
+class _Unread:
+    """页位标记：实物页位未读出（请求中的 ``"?"``）。单例 :data:`UNREAD`。"""
+
+    _instance = None
+
+    def __new__(cls) -> "_Unread":
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self) -> str:  # pragma: no cover - 仅便于调试
+        return "UNREAD"
+
+    def __bool__(self) -> bool:
+        return True
+
+
+UNREAD = _Unread()
+
+# 单个页位的值：页面 ID / None（空白）/ UNREAD（未读出）
+SlotValue = object
+
+
+def _hungarian_min(cost: List[List[int]]) -> List[int]:
+    """方阵最小权完美匹配（O(n³) 匈牙利算法）。
+
+    返回每个行号（0-based）匹配的列号（0-based）；输入方阵元素为整数
+    （允许负权、数值较大），不可行的行/列以 0 权“哑边”填充，由调用方按
+    真实边解码。
+    """
+    n = len(cost)
+    # 比任意可行松弛量都大：任意真实边的缩减代价绝对值不超过全部边权绝对值之和
+    inf = sum(abs(value) for row in cost for value in row) + 1
+    u = [0] * (n + 1)
+    v = [0] * (n + 1)
+    p = [0] * (n + 1)
+    way = [0] * (n + 1)
+
+    for i in range(1, n + 1):
+        p[0] = i
+        j0 = 0
+        minv = [inf] * (n + 1)
+        used = [False] * (n + 1)
+        while p[j0] != 0:
+            used[j0] = True
+            i0 = p[j0]
+            delta = inf
+            j1 = 0
+            for j in range(1, n + 1):
+                if not used[j]:
+                    cur = cost[i0 - 1][j - 1] - u[i0] - v[j]
+                    if cur < minv[j]:
+                        minv[j] = cur
+                        way[j] = j0
+                    if minv[j] < delta:
+                        delta = minv[j]
+                        j1 = j
+            for j in range(n + 1):
+                if used[j]:
+                    u[p[j]] += delta
+                    v[j] -= delta
+                else:
+                    minv[j] -= delta
+            j0 = j1
+        while True:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+            if j0 == 0:
+                break
+
+    assignment = [0] * n
+    for j in range(1, n + 1):
+        assignment[p[j] - 1] = j - 1
+    return assignment
+
+
+def inspect_observed_sheets(
+    page_ids: List[P],
+    max_sheets: int,
+    binding: Binding,
+    observed_sheets: List[Tuple[SlotValue, SlotValue, SlotValue, SlotValue]],
+) -> dict:
+    """将乱序实物印张与按 :func:`impose_from_pages` 生成的预期印张配对核对。
+
+    每张观测四页位的取值为页面 ID、``None``（空白）或 :data:`UNREAD`（未读出）。
+    观测可按 :data:`TRANSFORMS` 的四种变换（原样、左右镜像、正反互换、两者组合）
+    解释；仅当观测至少有一个**非空已读页面 ID**出现在某张预期印张上时，二者才
+    允许配对。在每张预期印张、每张观测至多使用一次的约束下：
+
+    1. 先最大化配对数；
+    2. 再最大化已读页位吻合数（``None`` 与 ``None`` 也算吻合，``UNREAD`` 不计）；
+    3. 同分按观测序号升序、预期帖号/张号升序、变换顺序裁决。
+
+    返回逐观测的配对结果（帖号/张号/变换/吻合数/已知页位错误明细），
+    以及未见的预期印张与无法配对的观测。
+    """
+    imposed = impose_from_pages(page_ids, max_sheets, binding)
+    expected: List[dict] = []
+    for signature in imposed:
+        for sheet in signature["sheets"]:
+            expected.append(
+                {
+                    "signature_index": signature["signature_index"],
+                    "sheet_index": sheet["sheet_index"],
+                    "slots": (
+                        sheet["front"]["left"],
+                        sheet["front"]["right"],
+                        sheet["back"]["left"],
+                        sheet["back"]["right"],
+                    ),
+                }
+            )
+
+    m = len(observed_sheets)
+    n = len(expected)
+
+    # edges[i]：观测 i 可配对的预期列 -> 候选信息（列号按帖号/张号升序）
+    edges: List[List[dict]] = []
+    for obs in observed_sheets:
+        known_ids = {v for v in obs if v is not None and v is not UNREAD}
+        candidates: List[dict] = []
+        for col, exp in enumerate(expected):
+            if not any(page_id in exp["slots"] for page_id in known_ids):
+                continue
+            best: Optional[dict] = None
+            for transform_index, (transform_name, perm) in enumerate(TRANSFORMS):
+                matches = 0
+                mismatches: List[dict] = []
+                for slot_index, value in enumerate(obs):
+                    if value is UNREAD:
+                        continue
+                    expected_value = exp["slots"][perm[slot_index]]
+                    if value == expected_value:
+                        matches += 1
+                    else:
+                        mismatches.append(
+                            {
+                                "position": SLOT_ORDER[slot_index],
+                                "observed": value,
+                                "expected": expected_value,
+                            }
+                        )
+                candidate = {
+                    "col": col,
+                    "matches": matches,
+                    "transform_index": transform_index,
+                    "transform": transform_name,
+                    "errors": mismatches,
+                }
+                # 变换顺序裁决：取吻合数最多、序号最小者
+                if best is None or (
+                    candidate["matches"],
+                    -candidate["transform_index"],
+                ) > (best["matches"], -best["transform_index"]):
+                    best = candidate
+            assert best is not None
+            candidates.append(best)
+        candidates.sort(key=lambda c: c["col"])
+        edges.append(candidates)
+
+    # 单次最大权匹配完成“配对数 → 吻合数 → 字典序”三级目标：
+    #   权重 = (PAIR_BASE + 吻合数) * BASE**m + 字典序奖赏
+    # PAIR_BASE 大于任一方案的吻合数与字典序奖赏上限，BASE 大于任一字典序数位
+    # 上限，因此整数位级比较严格对应目标优先级。字典序数位按观测序号从高位到
+    # 低位排列：配对（数位 (n-col)）恒优于不配对（0），同配对下列号越小越优。
+    size = max(m, n)
+    lex_base = size + 1
+    pair_base = 4 * m + lex_base ** m + 1
+    # lex_weight[i][col] 已按 BASE 定位到观测 i 的数位
+    lex_weight: List[List[int]] = [[0] * n for _ in range(m)]
+    lex_scale = 1
+    for i in range(m - 1, -1, -1):
+        for candidate in edges[i]:
+            lex_weight[i][candidate["col"]] = (n - candidate["col"]) * lex_scale
+        lex_scale *= lex_base
+
+    weight: List[List[int]] = [[0] * n for _ in range(m)]
+    for i in range(m):
+        for candidate in edges[i]:
+            col = candidate["col"]
+            weight[i][col] = (
+                (pair_base + candidate["matches"]) * lex_base ** m
+                + lex_weight[i][col]
+            )
+
+    # 匈牙利算法求最小权完美匹配；目标为最大化权和，故代价取负。
+    # 方阵补 0 权“哑边”（不可配对的观测/预期列），解码时只认真实边。
+    cost = [[0] * size for _ in range(size)]
+    for i in range(m):
+        for j in range(n):
+            cost[i][j] = -weight[i][j]
+    assignment = _hungarian_min(cost)
+
+    chosen: List[Optional[dict]] = [None] * m
+    edge_lookup = [
+        {candidate["col"]: candidate for candidate in candidates}
+        for candidates in edges
+    ]
+    for i, j in enumerate(assignment):
+        if i < m and j < n and j in edge_lookup[i]:
+            chosen[i] = edge_lookup[i][j]
+
+    fixed_pairs = sum(1 for candidate in chosen if candidate is not None)
+
+    result_observations: List[dict] = []
+    matched_cols = set()
+    for index, (obs, candidate) in enumerate(
+        zip(observed_sheets, chosen), start=1
+    ):
+        front_left, front_right, back_left, back_right = obs
+        item = {
+            "observation_index": index,
+            "front": {"left": front_left, "right": front_right},
+            "back": {"left": back_left, "right": back_right},
+            "matched": candidate is not None,
+            "signature_index": None,
+            "sheet_index": None,
+            "transform": None,
+            "matched_slot_count": 0,
+            "errors": [],
+        }
+        if candidate is not None:
+            exp = expected[candidate["col"]]
+            matched_cols.add(candidate["col"])
+            item.update(
+                {
+                    "signature_index": exp["signature_index"],
+                    "sheet_index": exp["sheet_index"],
+                    "transform": candidate["transform"],
+                    "matched_slot_count": candidate["matches"],
+                    "errors": candidate["errors"],
+                }
+            )
+        result_observations.append(item)
+
+    unseen_signatures = [
+        {
+            "signature_index": exp["signature_index"],
+            "sheet_index": exp["sheet_index"],
+            "front": {
+                "left": exp["slots"][0],
+                "right": exp["slots"][1],
+            },
+            "back": {
+                "left": exp["slots"][2],
+                "right": exp["slots"][3],
+            },
+        }
+        for col, exp in enumerate(expected)
+        if col not in matched_cols
+    ]
+
+    unmatched_observations = [
+        {
+            "observation_index": item["observation_index"],
+            "front": item["front"],
+            "back": item["back"],
+        }
+        for item in result_observations
+        if not item["matched"]
+    ]
+
+    return {
+        "max_sheets_per_signature": max_sheets,
+        "binding": binding,
+        "matched_observation_count": fixed_pairs,
+        "unmatched_observation_count": m - fixed_pairs,
+        "unseen_sheet_count": n - fixed_pairs,
+        "observations": result_observations,
+        "unmatched_observations": unmatched_observations,
+        "unseen_signatures": unseen_signatures,
+    }

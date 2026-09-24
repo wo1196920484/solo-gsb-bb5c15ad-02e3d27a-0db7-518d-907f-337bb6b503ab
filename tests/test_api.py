@@ -491,3 +491,334 @@ def test_reprint_missing_field():
         },
     )
     assert response.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# 印张抽检 /api/v1/impose/inspect
+# ---------------------------------------------------------------------------
+
+INSPECT_BASE = {
+    "page_ids": [f"p{i}" for i in range(1, 13)],
+    "max_sheets_per_signature": 2,
+    "binding": "left",
+}
+
+
+def test_inspect_perfect_and_unseen_and_unmatched():
+    # 12 页、每帖 2 张：帖1 p1..p8 两张，帖2 p9..p12（补 4 空白）一张
+    # obs1 原样=帖1最外张；obs2 正反互换=帖1内张；obs3 全 "?" -> 无法配对；
+    # 未见：帖2 的唯一印张
+    response = client.post(
+        "/api/v1/impose/inspect",
+        json={
+            **INSPECT_BASE,
+            "observed_sheets": [
+                {"front": {"left": "p8", "right": "p1"},
+                 "back": {"left": "p2", "right": "p7"}},
+                {"front": {"left": "p4", "right": "p5"},
+                 "back": {"left": "p6", "right": "p3"}},
+                {"front": {"left": "?", "right": "?"},
+                 "back": {"left": "?", "right": "?"}},
+            ],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["matched_observation_count"] == 2
+    assert data["unmatched_observation_count"] == 1
+    assert data["unseen_sheet_count"] == 1
+
+    o1, o2, o3 = data["observations"]
+    assert o1["matched"] is True
+    assert (o1["signature_index"], o1["sheet_index"]) == (1, 1)
+    assert o1["transform"] == "none"
+    assert o1["matched_slot_count"] == 4
+    assert o1["errors"] == []
+
+    assert o2["matched"] is True
+    assert (o2["signature_index"], o2["sheet_index"]) == (1, 2)
+    assert o2["transform"] == "flip_fb"
+    assert o2["matched_slot_count"] == 4
+
+    assert o3["matched"] is False
+    assert o3["signature_index"] is None
+    assert o3["sheet_index"] is None
+    assert o3["transform"] is None
+    assert o3["matched_slot_count"] == 0
+
+    assert [o["observation_index"] for o in data["unmatched_observations"]] == [3]
+    unseen = data["unseen_signatures"]
+    assert len(unseen) == 1
+    assert (unseen[0]["signature_index"], unseen[0]["sheet_index"]) == (2, 1)
+
+
+def test_inspect_mirror_and_both_transforms():
+    # 8 页单帖两张：最外张 (p8,p1)/(p2,p7)，内张 (p6,p3)/(p4,p5)
+    response = client.post(
+        "/api/v1/impose/inspect",
+        json={
+            "page_ids": [f"p{i}" for i in range(1, 9)],
+            "max_sheets_per_signature": 2,
+            "binding": "left",
+            "observed_sheets": [
+                {"front": {"left": "p1", "right": "p8"},
+                 "back": {"left": "p7", "right": "p2"}},  # 最外张的 mirror_lr
+                {"front": {"left": "p5", "right": "p4"},
+                 "back": {"left": "p3", "right": "p6"}},  # 内张的 mirror_lr_flip_fb
+            ],
+        },
+    )
+    assert response.status_code == 200
+    observations = response.json()["observations"]
+    assert observations[0]["transform"] == "mirror_lr"
+    assert observations[0]["matched_slot_count"] == 4
+    assert (observations[0]["signature_index"], observations[0]["sheet_index"]) == (1, 1)
+    assert observations[1]["transform"] == "mirror_lr_flip_fb"
+    assert observations[1]["matched_slot_count"] == 4
+    assert (observations[1]["signature_index"], observations[1]["sheet_index"]) == (1, 2)
+
+
+def test_inspect_errors_listed_and_question_mark_ignored():
+    response = client.post(
+        "/api/v1/impose/inspect",
+        json={
+            "page_ids": ["a", "b", "c", "d"],
+            "max_sheets_per_signature": 1,
+            "binding": "left",
+            "observed_sheets": [
+                {"front": {"left": "d", "right": "?"},
+                 "back": {"left": "X", "right": "c"}}
+            ],
+        },
+    )
+    assert response.status_code == 200
+    obs = response.json()["observations"][0]
+    assert obs["matched"] is True
+    assert obs["matched_slot_count"] == 2  # d 与 c 吻合；"?" 不计
+    assert obs["errors"] == [
+        {"position": "back_left", "observed": "X", "expected": "b"}
+    ]
+
+
+def test_inspect_null_blank_mismatch_error():
+    # 单页补 3 空白：预期 (null,a)/(null,null)
+    response = client.post(
+        "/api/v1/impose/inspect",
+        json={
+            "page_ids": ["a"],
+            "max_sheets_per_signature": 1,
+            "binding": "left",
+            "observed_sheets": [
+                {"front": {"left": "a", "right": "a"},
+                 "back": {"left": None, "right": None}}
+            ],
+        },
+    )
+    assert response.status_code == 200
+    obs = response.json()["observations"][0]
+    assert obs["matched_slot_count"] == 3
+    assert obs["errors"] == [
+        {"position": "front_left", "observed": "a", "expected": None}
+    ]
+
+
+def test_inspect_foreign_only_observation_unpaired():
+    response = client.post(
+        "/api/v1/impose/inspect",
+        json={
+            "page_ids": ["a", "b", "c", "d"],
+            "max_sheets_per_signature": 1,
+            "binding": "left",
+            "observed_sheets": [
+                {"front": {"left": "x", "right": "y"},
+                 "back": {"left": None, "right": "?"}}
+            ],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["matched_observation_count"] == 0
+    assert data["unmatched_observation_count"] == 1
+    assert data["observations"][0]["matched"] is False
+    assert data["unseen_sheet_count"] == 1
+
+
+def test_inspect_right_binding():
+    response = client.post(
+        "/api/v1/impose/inspect",
+        json={
+            "page_ids": ["a", "b", "c", "d"],
+            "max_sheets_per_signature": 1,
+            "binding": "right",
+            "observed_sheets": [
+                {"front": {"left": "a", "right": "d"},
+                 "back": {"left": "c", "right": "b"}}
+            ],
+        },
+    )
+    assert response.status_code == 200
+    obs = response.json()["observations"][0]
+    assert obs["transform"] == "none"
+    assert obs["matched_slot_count"] == 4
+
+
+def test_inspect_pair_count_takes_priority_over_matches():
+    # 两张观测都只能配帖1最外张（p8 只出现在该张）：
+    # 高吻合的 obs1 先取该张，obs2 落单；反之总配对数相同（1 对），
+    # 但 obs1 配对吻合更多，字典序也优先 obs1。
+    response = client.post(
+        "/api/v1/impose/inspect",
+        json={
+            **INSPECT_BASE,
+            "observed_sheets": [
+                {"front": {"left": "p8", "right": "p1"},
+                 "back": {"left": "p2", "right": "p7"}},
+                {"front": {"left": "p8", "right": None},
+                 "back": {"left": None, "right": None}},
+            ],
+        },
+    )
+    data = response.json()
+    assert data["matched_observation_count"] == 1
+    assert data["observations"][0]["matched"] is True
+    assert data["observations"][0]["matched_slot_count"] == 4
+    assert data["observations"][1]["matched"] is False
+    # 未见另外两张
+    assert data["unseen_sheet_count"] == 2
+
+
+def test_inspect_invalid_page_id_question_mark():
+    response = client.post(
+        "/api/v1/impose/inspect",
+        json={
+            **INSPECT_BASE,
+            "page_ids": ["p1", "?", "p3"],
+            "observed_sheets": [
+                {"front": {"left": "p1", "right": "p2"},
+                 "back": {"left": None, "right": None}}
+            ],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_inspect_duplicate_page_ids():
+    response = client.post(
+        "/api/v1/impose/inspect",
+        json={
+            **INSPECT_BASE,
+            "page_ids": ["p1", "p1", "p2"],
+            "observed_sheets": [
+                {"front": {"left": "p1", "right": "p2"},
+                 "back": {"left": None, "right": None}}
+            ],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_inspect_empty_page_ids():
+    response = client.post(
+        "/api/v1/impose/inspect",
+        json={
+            **INSPECT_BASE,
+            "page_ids": [],
+            "observed_sheets": [
+                {"front": {"left": "p1", "right": "p2"},
+                 "back": {"left": None, "right": None}}
+            ],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_inspect_empty_observed_sheets():
+    response = client.post(
+        "/api/v1/impose/inspect",
+        json={**INSPECT_BASE, "observed_sheets": []},
+    )
+    assert response.status_code == 422
+
+
+def test_inspect_blank_slot_string_rejected():
+    response = client.post(
+        "/api/v1/impose/inspect",
+        json={
+            **INSPECT_BASE,
+            "observed_sheets": [
+                {"front": {"left": "  ", "right": "p1"},
+                 "back": {"left": None, "right": None}}
+            ],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_inspect_invalid_max_sheets():
+    response = client.post(
+        "/api/v1/impose/inspect",
+        json={
+            **INSPECT_BASE,
+            "max_sheets_per_signature": 0,
+            "observed_sheets": [
+                {"front": {"left": "p1", "right": "p2"},
+                 "back": {"left": None, "right": None}}
+            ],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_inspect_invalid_binding():
+    response = client.post(
+        "/api/v1/impose/inspect",
+        json={
+            **INSPECT_BASE,
+            "binding": "top",
+            "observed_sheets": [
+                {"front": {"left": "p1", "right": "p2"},
+                 "back": {"left": None, "right": None}}
+            ],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_inspect_unknown_field_rejected():
+    response = client.post(
+        "/api/v1/impose/inspect",
+        json={
+            **INSPECT_BASE,
+            "observed_sheets": [
+                {"front": {"left": "p8", "right": "p1"},
+                 "back": {"left": "p2", "right": "p7"},
+                 "extra": 1}
+            ],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_inspect_missing_field():
+    response = client.post(
+        "/api/v1/impose/inspect",
+        json={
+            "page_ids": INSPECT_BASE["page_ids"],
+            "max_sheets_per_signature": 2,
+            "binding": "left",
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_reprint_missing_field_legacy():
+    response = client.post(
+        "/api/v1/impose/reprint",
+        json={
+            "old_page_ids": ["a"],
+            "new_page_ids": ["a"],
+            "max_sheets_per_signature": 2,
+            "binding": "left",
+        },
+    )
+    assert response.status_code == 422

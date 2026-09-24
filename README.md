@@ -10,6 +10,10 @@
 在新版四页位与旧版某印张完全相同且均未改动时整张复用（允许跨帖、每张旧印张最多复用一次），
 否则标记整张重印。
 
+还提供**印张抽检**接口 `/api/v1/impose/inspect`：把车间乱序拍回的实物印张（每张可能被
+原样、左右镜像、正反互换或两者组合地读出）与按相同拼版规则生成的预期印张配对，先最大化配对数、
+再最大化已读页位吻合数，并逐张给出帖号/张号、解释变换与已知页位错误明细。
+
 ## 一条命令启动
 
 需要安装 Docker（含 Compose 插件），在项目根目录执行：
@@ -49,6 +53,7 @@ HOST_PORT=9000 docker compose up -d --build
 - 拼版接口：`POST http://localhost:8000/api/v1/impose`
 - 章节分帖拼版接口：`POST http://localhost:8000/api/v1/impose/chapters`
 - 重印复用接口：`POST http://localhost:8000/api/v1/impose/reprint`
+- 印张抽检接口：`POST http://localhost:8000/api/v1/impose/inspect`
 
 ## 接口说明
 
@@ -295,6 +300,150 @@ curl -X POST http://localhost:8000/api/v1/impose/reprint \
 除与 `/api/v1/impose` 相同的校验（`max_sheets_per_signature`、`binding`、未定义字段等）外，
 任一版页面 ID 列表为空、包含空字符串、版内 ID 重复，或 `changed_page_ids` 包含空字符串、
 含有不属于新版的页面 ID 时，均返回 `422 Unprocessable Entity`。
+
+## 印张抽检（POST /api/v1/impose/inspect）
+
+车间实拍/人工读回的**实物印张是乱序的**，且每张纸拿起时的朝向不固定。本接口先沿用
+`/api/v1/impose` 的拼版规则（含末帖尾部补空白与左/右装订镜像）由页面 ID 生成**预期印张**，
+再把每张实物观测与预期印张配对核对。本地访问地址
+`http://localhost:8000/api/v1/impose/inspect`（改了 `HOST_PORT` 则对应替换端口）。
+
+### 请求
+
+`POST /api/v1/impose/inspect`，`Content-Type: application/json`
+
+| 字段 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `page_ids` | 字符串数组 | 非空；非空字符串、**互不重复**，且不能为 `"?"` | 页面 ID，按**阅读顺序**排列 |
+| `max_sheets_per_signature` | 整数 | ≥ 1 | 每帖最多纸张数；每帖最多容纳其 4 倍页数 |
+| `binding` | 字符串 | `left` / `right` | 装订方向：左装订 / 右装订 |
+| `observed_sheets` | 对象数组 | 非空 | 乱序的实物印张；每张含 `front`/`back`，其 `left`/`right` 页位为页面 ID、`null`（空白）或 `"?"`（未读出） |
+
+页位三态含义：
+
+- 页面 ID（非空字符串，不能是 `"?"`）：该页位读出的页面；ID 不要求出现在 `page_ids`
+  中——读到外来 ID 时仍可配对，但该页位计为错误；
+- `null`：明确读到的**空白页位**（是已知信息，与预期 `null` 吻合算对，与预期页面 ID 不符算错）；
+- `"?"`：该页位**未读出**（不计错、不参与吻合数，也不能作为配对线索）。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/impose/inspect \
+  -H "Content-Type: application/json" \
+  -d '{
+    "page_ids": ["p1","p2","p3","p4","p5","p6","p7","p8","p9","p10","p11","p12"],
+    "max_sheets_per_signature": 2,
+    "binding": "left",
+    "observed_sheets": [
+      {"front": {"left": "p8", "right": "p1"}, "back": {"left": "p2", "right": "?"}},
+      {"front": {"left": "p4", "right": "p5"}, "back": {"left": "p6", "right": "pX"}},
+      {"front": {"left": "?",  "right": "?"},  "back": {"left": "z9", "right": "?"}}
+    ]
+  }'
+```
+
+### 配对与裁决规则
+
+每张观测可按以下 **4 种变换**之一解释（`none` 原样、`mirror_lr` 左右镜像、
+`flip_fb` 正反互换、`mirror_lr_flip_fb` 两者组合）：
+
+1. **配对门槛**：观测至少有一个非空、已读（非 `"?"`）的页面 ID 出现在该张预期印张的
+   四个页位中，才允许与该张配对；全为 `null`/`"?"`、或只有外来 ID 的观测无法配对。
+2. 在**每张预期印张、每张观测至多使用一次**的前提下，依次优化：
+   1. **最大化配对数**；
+   2. 再最大化全部配对的**已读页位吻合数**（页面 ID 相同或 `null` 对 `null` 算吻合，
+      `"?"` 不计入）；
+   3. 仍同分则按 **观测序号升序 → 预期帖号/张号升序 → 变换顺序
+      （`none`、`mirror_lr`、`flip_fb`、`mirror_lr_flip_fb`）** 裁决。
+3. 同一观测与某张预期印张之间，取吻合数最多的变换；吻合数相同取变换顺序最前者。
+   `"?"` 不计错；其余已知页位（含 `null`）与按选定变换解释后的预期不符时，逐条列入
+   `errors`。
+
+### 响应
+
+`observations` 按请求中的观测顺序逐张返回：
+
+- `matched`：是否配对成功；成功时给出 `signature_index` / `sheet_index`（均从 1 开始，
+  张号 1 为最外张）与 `transform`；失败时这三项为 `null`；
+- `matched_slot_count`：已读页位吻合数（`"?"` 不计入）；
+- `errors`：已知页位错误明细，每项含 `position`
+  （`front_left` / `front_right` / `back_left` / `back_right`，按观测**原样朝向**）、
+  `observed`（读到的 ID 或 `null`）、`expected`（按选定变换解释后的预期 ID 或 `null`）；
+- 顶层另给出 `unmatched_observations`（无法配对的观测，按观测序号排列）与
+  `unseen_signatures`（未见的预期印张，按帖号/张号排列）及三者的计数。
+
+上例中：观测 1 原样对应第 1 帖最外张（1 个 `"?"`，吻合 3 个页位）；
+观测 2 按正反互换对应第 1 帖内张，唯读错的 `back_right` 应为 `p3`；
+观测 3 只有外来 ID `z9` 无法配对；第 2 帖印张未见。
+
+```json
+{
+  "page_ids": ["p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9", "p10", "p11", "p12"],
+  "max_sheets_per_signature": 2,
+  "binding": "left",
+  "matched_observation_count": 2,
+  "unmatched_observation_count": 1,
+  "unseen_sheet_count": 1,
+  "observations": [
+    {
+      "observation_index": 1,
+      "front": { "left": "p8", "right": "p1" },
+      "back": { "left": "p2", "right": "?" },
+      "matched": true,
+      "signature_index": 1,
+      "sheet_index": 1,
+      "transform": "none",
+      "matched_slot_count": 3,
+      "errors": []
+    },
+    {
+      "observation_index": 2,
+      "front": { "left": "p4", "right": "p5" },
+      "back": { "left": "p6", "right": "pX" },
+      "matched": true,
+      "signature_index": 1,
+      "sheet_index": 2,
+      "transform": "flip_fb",
+      "matched_slot_count": 3,
+      "errors": [
+        { "position": "back_right", "observed": "pX", "expected": "p3" }
+      ]
+    },
+    {
+      "observation_index": 3,
+      "front": { "left": "?", "right": "?" },
+      "back": { "left": "z9", "right": "?" },
+      "matched": false,
+      "signature_index": null,
+      "sheet_index": null,
+      "transform": null,
+      "matched_slot_count": 0,
+      "errors": []
+    }
+  ],
+  "unmatched_observations": [
+    {
+      "observation_index": 3,
+      "front": { "left": "?", "right": "?" },
+      "back": { "left": "z9", "right": "?" }
+    }
+  ],
+  "unseen_signatures": [
+    {
+      "signature_index": 2,
+      "sheet_index": 1,
+      "front": { "left": "p12", "right": "p9" },
+      "back": { "left": "p10", "right": "p11" }
+    }
+  ]
+}
+```
+
+### 非法参数（4xx）
+
+除与 `/api/v1/impose` 相同的校验（`max_sheets_per_signature`、`binding`、未定义字段等）外，
+`page_ids` 或 `observed_sheets` 为空、页面 ID 为空字符串/重复/为 `"?"`，
+或实物页位为空字符串时，均返回 `422 Unprocessable Entity`。
+（页位缺字段或类型错误同样返回 422；空白页须显式传 `null`，未读出传 `"?"`。）
 
 ## 本地开发（不使用 Docker）
 
